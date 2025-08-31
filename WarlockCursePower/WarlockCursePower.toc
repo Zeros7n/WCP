@@ -1,0 +1,19 @@
+## Interface: 11507
+## Title: Warlock Curse Power
+## Notes: Assign curses/banishes and sync them across the group
+## Author: Az-Dreamscythe
+## Version: 1.0.0
+## SavedVariables: CursePowerDB
+
+# --- Core (order matters) ---
+libs\LibStub\LibStub.lua
+libs\CallbackHandler-1.0\CallbackHandler-1.0.xml
+
+# --- Ace libs we use (no AceAddon needed) ---
+libs\AceComm-3.0\AceComm-3.0.xml
+libs\AceSerializer-3.0\AceSerializer-3.0.xml
+libs\AceDB-3.0\AceDB-3.0.xml
+libs\AceGUI-3.0\AceGUI-3.0.xml
+
+# --- Addon code ---
+main.lua
