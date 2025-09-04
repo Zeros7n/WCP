@@ -283,9 +283,9 @@ local function makeHeader()
   local header = AceGUI:Create("SimpleGroup")
   header:SetFullWidth(true); header:SetHeight(28); header:SetLayout("Flow")
 
-  local l1 = AceGUI:Create("Label"); l1:SetText("|cffffd100Warlock:|r"); l1:SetWidth(220); header:AddChild(l1)
-  local l2 = AceGUI:Create("Label"); l2:SetText("|cffffd100Curse Assignment:|r"); l2:SetWidth(300); header:AddChild(l2)
-  local l3 = AceGUI:Create("Label"); l3:SetText("|cffffd100Banish Assignment:|r"); l3:SetWidth(200); header:AddChild(l3)
+  local l1 = AceGUI:Create("Label"); l1:SetText("|cffffd100Warlock:|r"); l1:SetRelativeWidth(0.33); header:AddChild(l1)
+  local l2 = AceGUI:Create("Label"); l2:SetText("|cffffd100Curse Assignment:|r"); l2:SetRelativeWidth(0.34); header:AddChild(l2)
+  local l3 = AceGUI:Create("Label"); l3:SetText("|cffffd100Banish Assignment:|r"); l3:SetRelativeWidth(0.33); header:AddChild(l3)
   return header
 end
 
@@ -380,7 +380,8 @@ local function dropdownFromChoices(choices, initialKey, width, onChange)
   local list, order = {}, {}
   for k, t in pairs(choices) do list[k] = t; order[#order + 1] = k end
   table.sort(order, function(a, b) if a == "NONE" then return true elseif b == "NONE" then return false else return a < b end end)
-  d:SetList(list, order); d:SetValue(initialKey or "NONE"); d:SetWidth(width or 260)
+  d:SetList(list, order); d:SetValue(initialKey or "NONE")
+  if width then d:SetWidth(width) end
   if onChange then d:SetCallback("OnValueChanged", function(_, _, k) onChange(k) end) end
   skinDropdown(d)
   return d
@@ -477,10 +478,10 @@ function Addon:RebuildRows()
   self:ReleaseRows()
   for _, name in ipairs(playerListWarlocks()) do
     local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); row:SetHeight(28)
-    local nameLbl = AceGUI:Create("Label"); nameLbl:SetWidth(220); nameLbl:SetText(string.format("|cffffff00%s|r", name)); row:AddChild(nameLbl)
+    local nameLbl = AceGUI:Create("Label"); nameLbl:SetRelativeWidth(0.33); nameLbl:SetText(string.format("|cffffff00%s|r", name)); row:AddChild(nameLbl)
     local a = getAssignment(name)
-    local curse = dropdownFromChoices(CURSE_CHOICES, a.curse, 300, function(newK) setAssignment(name, newK, nil); debugf("Set curse for %s -> %s", name, CURSE_CHOICES[newK] or newK); broadcastSet(name, "curse", newK) end); row:AddChild(curse)
-    local ban   = dropdownFromChoices(BANISH_CHOICES, a.banish, 200, function(newK) setAssignment(name, nil, newK); debugf("Set banish for %s -> %s", name, BANISH_NAMES[newK] or newK); broadcastSet(name, "banish", newK) end); row:AddChild(ban)
+    local curse = dropdownFromChoices(CURSE_CHOICES, a.curse, nil, function(newK) setAssignment(name, newK, nil); debugf("Set curse for %s -> %s", name, CURSE_CHOICES[newK] or newK); broadcastSet(name, "curse", newK) end); curse:SetRelativeWidth(0.34); row:AddChild(curse)
+    local ban   = dropdownFromChoices(BANISH_CHOICES, a.banish, nil, function(newK) setAssignment(name, nil, newK); debugf("Set banish for %s -> %s", name, BANISH_NAMES[newK] or newK); broadcastSet(name, "banish", newK) end); ban:SetRelativeWidth(0.33); row:AddChild(ban)
     self.ui.rowsGroup:AddChild(row)
     self.ui.rows[name] = { group = row, nameLabel = nameLbl, curseDrop = curse, banishDrop = ban }
   end
@@ -537,6 +538,175 @@ SlashCmdList["WCP"] = function(msg)
   if Addon.ui.frame then Addon.ui.frame:Hide(); Addon.ui.frame = nil else Addon:BuildWindow() end
 end
 
+-- =================== Compact Assignment Summary Window ===================
+Addon.compactUI = { frame = nil }
+
+-- Abbreviated curse icons (16x16) for compact display
+local CURSE_ICONS = {
+  COE = "Interface\\Icons\\Spell_Shadow_ChillTouch",           -- Curse of Elements
+  COS = "Interface\\Icons\\Spell_Shadow_CurseOfAchimonde",     -- Curse of Shadow
+  COR = "Interface\\Icons\\Spell_Shadow_UnholyStrength",       -- Curse of Recklessness
+  COW = "Interface\\Icons\\Spell_Shadow_CurseOfMannoroth",     -- Curse of Weakness
+  COA = 136139,         -- Curse of Agony
+  COD = "Interface\\Icons\\Spell_Shadow_AuraOfDarkness",       -- Curse of Doom
+  COT = "Interface\\Icons\\Spell_Shadow_CurseOfTounges",       -- Curse of Tongues
+  NONE = nil,
+}
+
+local function getCurseIconOrAbbr(key)
+  local icon = CURSE_ICONS[key]
+  if icon then
+    return "|T" .. icon .. ":16:16:0:0:64:64:4:60:4:60|t"
+  end
+  return key or "-"
+end
+
+local function getBanishIcon(key)
+  local icons = {
+    RT1  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_1:16|t",
+    RT2  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_2:16|t",
+    RT3  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_3:16|t",
+    RT4  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_4:16|t",
+    RT5  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_5:16|t",
+    RT6  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_6:16|t",
+    RT7  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_7:16|t",
+    RT8  = "|TInterface\\TargetingFrame\\UI-RaidTargetingIcon_8:16|t",
+    NONE = "",
+  }
+  return icons[key] or ""
+end
+
+-- Add missing hasAnyAssignments function
+local function hasAnyAssignments()
+  for _, name in ipairs(playerListWarlocks()) do
+    local a = getAssignment(name)
+    if a and ((a.curse and a.curse ~= "NONE") or (a.banish and a.banish ~= "NONE")) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Track if the user manually closed the summary box
+Addon.compactUIUserClosed = false
+
+function Addon:ShowCompactWindow(force)
+  if Addon.compactUIUserClosed and not force then return end
+
+  if self.compactUI.frame then
+    self.compactUI.frame:Show()
+    self:UpdateCompactRows()
+    return
+  end
+
+  local f = AceGUI:Create("Frame")
+  f:SetTitle("WCP Assignments")
+  f:SetWidth(220); f:SetHeight(180)
+  f:SetLayout("List")
+  f:EnableResize(false)
+  stripFrameBorders(f.frame)
+  ensureBackdrop(f.frame, 0.5)
+
+  -- Assignment rows
+  local rows = AceGUI:Create("SimpleGroup")
+  rows:SetFullWidth(true)
+  rows:SetLayout("List")
+  f:AddChild(rows)
+
+  function Addon:UpdateCompactRows()
+    if Addon.compactUIUserClosed then return end
+    rows:ReleaseChildren()
+    for _, name in ipairs(playerListWarlocks()) do
+      local a = getAssignment(name)
+      local curseIcon = getCurseIconOrAbbr(a.curse)
+      local curseText = CURSE_CHOICES[a.curse] or "-"
+      local banishIcon = getBanishIcon(a.banish)
+      local row = AceGUI:Create("InteractiveLabel")
+      row:SetText(string.format("|cffffff00%s|r  %s %s  %s", name, curseIcon, curseText, banishIcon))
+      row:SetFullWidth(true)
+      rows:AddChild(row)
+    end
+  end
+
+  -- Bottom button group (Notify + Close)
+  local buttonGroup = AceGUI:Create("SimpleGroup")
+  buttonGroup:SetLayout("Flow")
+  buttonGroup:SetFullWidth(true)
+
+  -- Notify button
+  local notifyBtn = AceGUI:Create("Button")
+  notifyBtn:SetText("Notify")
+  notifyBtn:SetWidth(90)
+  notifyBtn:SetCallback("OnClick", function() Addon:AnnounceAssignments() end)
+  buttonGroup:AddChild(notifyBtn)
+
+  -- Close button (calls the same logic as the window X)
+  local closeBtn = AceGUI:Create("Button")
+  closeBtn:SetText("Close")
+  closeBtn:SetWidth(90)
+  closeBtn:SetCallback("OnClick", function()
+    Addon.compactUIUserClosed = true
+    f:Hide()
+  end)
+  buttonGroup:AddChild(closeBtn)
+
+  f:AddChild(buttonGroup)
+
+  -- When the user closes the frame via the window X, remember it
+  f:SetCallback("OnClose", function(widget)
+    Addon.compactUIUserClosed = true
+    widget:Hide()
+  end)
+
+  self.compactUI.frame = f
+  self:UpdateCompactRows()
+end
+
+function Addon:AutoCompactWindow()
+  -- Only show if not manually closed
+  if hasAnyAssignments() then
+    Addon:ShowCompactWindow()
+  elseif self.compactUI.frame then
+    self.compactUI.frame:Hide()
+  end
+end
+
+-- Update summary box rows whenever assignments/banishes change, but only if visible and not user-closed
+hooksecurefunc(Addon, "RebuildRows", function(self)
+  if Addon.compactUI.frame and Addon.compactUI.frame:IsShown() and not Addon.compactUIUserClosed then
+    Addon:UpdateCompactRows()
+  end
+end)
+
+-- Also check on login and group changes
+local ef2 = CreateFrame("Frame")
+ef2:RegisterEvent("PLAYER_LOGIN")
+ef2:RegisterEvent("GROUP_ROSTER_UPDATE")
+ef2:RegisterEvent("PLAYER_ROLES_ASSIGNED")
+ef2:SetScript("OnEvent", function(_, evt)
+  if evt == "PLAYER_LOGIN" or evt == "GROUP_ROSTER_UPDATE" or evt == "PLAYER_ROLES_ASSIGNED" then
+    Addon:AutoCompactWindow()
+  end
+  if evt == "PLAYER_LOGIN" then
+    Addon:RegisterComm(COMM_PREFIX)
+    debugf("PLAYER_LOGIN: RegisterComm(%s) done", COMM_PREFIX)
+  else
+    if Addon.ui.frame then Addon:RebuildRows() end
+  end
+end)
+
+-- Slash command to toggle compact window (force open, reset manual close)
+SLASH_WCPSUMMARY1 = "/wcpsummary"
+SlashCmdList["WCPSUMMARY"] = function()
+  Addon.compactUIUserClosed = false
+  if Addon.compactUI.frame and Addon.compactUI.frame:IsShown() then
+    Addon.compactUI.frame:Hide()
+    Addon.compactUIUserClosed = true
+  else
+    Addon:ShowCompactWindow(true)
+  end
+end
+
 if not AceGUI or not AceSerializer or not AceDB or not AceComm then
-  print("|cffff0000[WCP]|r Missing required libraries. Check your .toc includes.")
+  print("|cffff0000[WCP]|r Missing required libraries. Check your installation.")
 end
