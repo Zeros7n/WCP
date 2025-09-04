@@ -24,3 +24,9 @@ Patch V1.0.1:
 - Added wcpsummary window with notify options:
 
  <img width="307" height="255" alt="image" src="https://github.com/user-attachments/assets/9346c720-a630-4943-8e74-3e63cbeac593" />
+<br>
+How to download:
+1) Click the drop down menu next to the green Code button on the main github link page.
+2) Select, Download zip file.
+3) Install into your addons folder
+Enjoy!
