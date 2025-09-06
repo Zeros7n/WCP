@@ -2,7 +2,7 @@
 ## Title: Warlock Curse Power
 ## Notes: Assign curses/banishes and sync them across the group
 ## Author: Az-Dreamscythe
-## Version: 1.0.0
+## Version: @project-version@
 ## SavedVariables: CursePowerDB
 
 # --- Core (order matters) ---

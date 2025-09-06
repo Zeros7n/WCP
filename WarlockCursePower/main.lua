@@ -200,6 +200,21 @@ function Addon:OnCommReceived(prefix, message, distribution, sender)
     if Addon.RebuildRows then Addon:RebuildRows() end
     return
   end
+
+  -- Version check logic
+  if decoded.op == "version" and type(decoded.version) == "string" then
+    Addon.versions[from] = decoded.version
+    if decoded.version ~= ADDON_VERSION then
+      local msg
+      if decoded.version > ADDON_VERSION then
+        msg = string.format("|cffff5555[WCP]|r %s is using a newer version (%s). Please update!", from, decoded.version)
+      else
+        msg = string.format("|cffff5555[WCP]|r %s is using an older version (%s). Ask them to update!", from, decoded.version)
+      end
+      DEFAULT_CHAT_FRAME:AddMessage(msg)
+    end
+    return
+  end
 end
 
 Addon:RegisterComm(COMM_PREFIX)
@@ -704,6 +719,69 @@ SlashCmdList["WCPSUMMARY"] = function()
     Addon.compactUIUserClosed = true
   else
     Addon:ShowCompactWindow(true)
+  end
+end
+
+local ADDON_VERSION = WarlockCursePower_VERSION or "dev"
+
+-- Track if we've already sent a version check this session
+Addon.versionCheckSent = false
+Addon.versions = {}
+
+function Addon:SendVersionCheck()
+  if Addon.versionCheckSent then return end
+  Addon.versionCheckSent = true
+
+  local payload = { op = "version", version = ADDON_VERSION }
+  local serialized = AceSerializer:Serialize(payload)
+  local chan = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
+  if chan then
+    Addon:SendCommMessage(COMM_PREFIX, serialized, chan)
+  end
+  eachOnlineGroupMember(function(name, unit)
+    if classIsWarlock(unit) then
+      Addon:SendCommMessage(COMM_PREFIX, serialized, "WHISPER", name)
+    end
+  end)
+end
+
+-- On login or group change, send version check (only once per session)
+local efVersion = CreateFrame("Frame")
+efVersion:RegisterEvent("PLAYER_LOGIN")
+efVersion:RegisterEvent("GROUP_ROSTER_UPDATE")
+efVersion:SetScript("OnEvent", function(_, evt)
+  if evt == "PLAYER_LOGIN" or evt == "GROUP_ROSTER_UPDATE" then
+    C_Timer.After(2, function() Addon:SendVersionCheck() end)
+  end
+end)
+
+-- Update OnCommReceived to handle version checks
+local oldOnCommReceived = Addon.OnCommReceived
+function Addon:OnCommReceived(prefix, message, distribution, sender)
+  if prefix ~= COMM_PREFIX then return end
+  local me   = safeAmbiguate(UnitName("player"))
+  local from = safeAmbiguate(sender or "")
+  local ok, decoded = AceSerializer:Deserialize(message)
+  if not ok or type(decoded) ~= "table" then return end
+
+  -- Version check logic
+  if decoded.op == "version" and type(decoded.version) == "string" then
+    Addon.versions[from] = decoded.version
+    if decoded.version ~= ADDON_VERSION then
+      local msg
+      if decoded.version > ADDON_VERSION then
+        msg = string.format("|cffff5555[WCP]|r %s is using a newer version (%s). Please update!", from, decoded.version)
+      else
+        msg = string.format("|cffff5555[WCP]|r %s is using an older version (%s). Ask them to update!", from, decoded.version)
+      end
+      DEFAULT_CHAT_FRAME:AddMessage(msg)
+    end
+    return
+  end
+
+  -- Call the original OnCommReceived for assignment sync
+  if oldOnCommReceived then
+    oldOnCommReceived(self, prefix, message, distribution, sender)
   end
 end
 
