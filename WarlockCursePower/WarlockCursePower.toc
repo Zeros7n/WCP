@@ -4,6 +4,7 @@
 ## Author: Az-Dreamscythe
 ## Version: @project-version@
 ## SavedVariables: CursePowerDB
+## SavedVariables: WCP_DB
 
 # --- Core (order matters) ---
 libs\LibStub\LibStub.lua
