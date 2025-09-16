@@ -1,7 +1,14 @@
 -- Warlock Curse Power - main.lua (Classic Era 1.15.7)
 -- AceComm sync, borderless modern UI, chat-safe announce with raid icons,
 -- streamlined notify lines, bottom-anchored centered control row,
--- borderless dropdowns (first-click), and ESC to close without blocking input.
+-- borderless dropdowns (first-click), ESC to close without blocking input,
+-- unified OnCommReceived with version debounce,
+-- persistent compact window position (ElvUI-safe),
+-- iconized Curse dropdown (matches Banish),
+-- cleanup of legacy summary position fields,
+-- /wcp resetsummary command, and /wcpsummary + /wcps to open the summary,
+-- saved-assignments fallback & live wcps updates,
+-- and (optional) curse icons in chat via texture tags.
 
 local ADDON_NAME, COMM_PREFIX = "WarlockCursePower", "WCP1"
 
@@ -18,7 +25,13 @@ local defaults = {
   profile = {
     assignments = {},            -- [playerName] = { curse = "<key>", banish = "<key>" }
     debug = false,
+    chatIcons = false,           -- if true, include |T...|t texture tags for curses in chat
     frame = { width = 720, height = 380, point = "CENTER", x = 0, y = 0 },
+    summary = {                  -- compact summary window prefs (size + hidden only)
+      width  = 260,
+      height = 200,
+      hidden = false,            -- true if user intentionally hid it
+    },
   }
 }
 Addon.db = AceDB:New("CursePowerDB", defaults, true)
@@ -47,15 +60,22 @@ end
 
 local function safeAmbiguate(name) return Ambiguate and Ambiguate(name, "none") or name end
 
--- Strip UI escapes from chat; optionally keep {rt#} tokens so icons render in chat
-local function toChatSafe(s, keepRaidTokens)
+-- Strip UI escapes from chat; optionally keep {rt#} tokens and |T...|t texture tags
+local function toChatSafe(s, keepRaidTokens, keepTextures)
   if type(s) ~= "string" then s = tostring(s or "") end
-  s = s:gsub("|T.-|t", "")
-       :gsub("|H.-|h(.-)|h", "%1")
+  -- remove texture tags only if not keeping them
+  if not keepTextures then
+    s = s:gsub("|T.-|t", "")
+  end
+  -- strip links and color codes
+  s = s:gsub("|H.-|h(.-)|h", "%1")
        :gsub("|c%x%x%x%x%x%x%x%x", "")
        :gsub("|r", "")
   if not keepRaidTokens then s = s:gsub("{rt[1-8]}", "") end
-  s = s:gsub("|", "")
+  -- IMPORTANT: do NOT nuke all pipes when keeping textures
+  if not keepTextures then
+    s = s:gsub("|", "")
+  end
   return s
 end
 
@@ -86,29 +106,56 @@ local function eachOnlineGroupMember(cb)
   debugf("eachOnlineGroupMember total=%d", counted)
 end
 
+-- unique adder
+local function addNameUnique(arr, name, seen)
+  if not name or name == "" then return end
+  seen = seen or {}
+  if not seen[name] then
+    arr[#arr+1] = name
+    seen[name] = true
+  end
+end
+
 local function playerListWarlocks()
-  local names = {}
+  local names, seen = {}, {}
   if IsInRaid() then
     for i = 1, GetNumGroupMembers() do
       local u = "raid" .. i
-      if UnitExists(u) and UnitIsPlayer(u) and classIsWarlock(u) then local n = UnitName(u); if n then names[#names+1] = n end end
+      if UnitExists(u) and UnitIsPlayer(u) and classIsWarlock(u) then
+        addNameUnique(names, UnitName(u), seen)
+      end
     end
   elseif IsInGroup() then
     for i = 1, GetNumGroupMembers() do
       local u = "party" .. i
-      if UnitExists(u) and UnitIsPlayer(u) and classIsWarlock(u) then local n = UnitName(u); if n then names[#names+1] = n end end
+      if UnitExists(u) and UnitIsPlayer(u) and classIsWarlock(u) then
+        addNameUnique(names, UnitName(u), seen)
+      end
     end
-    if classIsWarlock("player") then names[#names+1] = UnitName("player") end
+    if classIsWarlock("player") then addNameUnique(names, UnitName("player"), seen) end
   else
-    if classIsWarlock("player") then names[#names+1] = UnitName("player") end
+    if classIsWarlock("player") then addNameUnique(names, UnitName("player"), seen) end
   end
-  if (#names == 0) and Addon.ui and Addon.ui.rows then for name,_ in pairs(Addon.ui.rows) do names[#names+1] = name end end
+
+  -- fallback to saved assignments if nothing detected (e.g., after reload, solo, etc.)
+  if #names == 0 then
+    for n,_ in pairs(Addon.db.profile.assignments or {}) do
+      addNameUnique(names, n, seen)
+    end
+  end
+
+  -- in-session rows fallback
+  if (#names == 0) and Addon.ui and Addon.ui.rows then
+    for n,_ in pairs(Addon.ui.rows) do addNameUnique(names, n, seen) end
+  end
+
   table.sort(names, function(a,b) return (a or "") < (b or "") end)
   return names
 end
 
 -- ===================== Assignment model ==========================
-local CURSE_CHOICES = {
+-- Plain names for logic/chat
+local CURSE_NAMES = {
   NONE = "-",
   COE  = "Curse of Elements",
   COS  = "Curse of Shadow",
@@ -118,6 +165,32 @@ local CURSE_CHOICES = {
   COD  = "Curse of Doom",
   COT  = "Curse of Tongues",
 }
+
+-- UI labels with icons for dropdowns (selected value + list)
+local CURSE_CHOICES = {
+  NONE = "-",
+  COE  = "|TInterface\\Icons\\Spell_Shadow_ChillTouch:0|t Curse of Elements",
+  COS  = "|TInterface\\Icons\\Spell_Shadow_CurseOfAchimonde:0|t Curse of Shadow",
+  COR  = "|TInterface\\Icons\\Spell_Shadow_UnholyStrength:0|t Curse of Recklessness",
+  COW  = "|TInterface\\Icons\\Spell_Shadow_CurseOfMannoroth:0|t Curse of Weakness",
+  COA  = "|T136139:0|t Curse of Agony",  -- fileID
+  COD  = "|TInterface\\Icons\\Spell_Shadow_AuraOfDarkness:0|t Curse of Doom",
+  COT  = "|TInterface\\Icons\\Spell_Shadow_CurseOfTounges:0|t Curse of Tongues", -- Blizz asset typo
+}
+
+-- Chat-sized icons (optional)
+local CURSE_CHAT_ICONS = {
+  COE = "|TInterface\\Icons\\Spell_Shadow_ChillTouch:0|t",
+  COS = "|TInterface\\Icons\\Spell_Shadow_CurseOfAchimonde:0|t",
+  COR = "|TInterface\\Icons\\Spell_Shadow_UnholyStrength:0|t",
+  COW = "|TInterface\\Icons\\Spell_Shadow_CurseOfMannoroth:0|t",
+  COA = "|T136139:0|t",
+  COD = "|TInterface\\Icons\\Spell_Shadow_AuraOfDarkness:0|t",
+  COT = "|TInterface\\Icons\\Spell_Shadow_CurseOfTounges:0|t",
+  NONE = "",
+}
+
+local VALID_CURSE = {}; for k in pairs(CURSE_NAMES) do VALID_CURSE[k] = true end
 
 -- UI labels with icons (for dropdowns)
 local BANISH_CHOICES = {
@@ -171,54 +244,6 @@ end
 local function clearAssignments() Addon.db.profile.assignments = {} end
 
 -- ============================== Sync (AceComm) ==============================
-function Addon:OnCommReceived(prefix, message, distribution, sender)
-  if prefix ~= COMM_PREFIX then return end
-  local me   = safeAmbiguate(UnitName("player"))
-  local from = safeAmbiguate(sender or "")
-  debugf("OnCommReceived: from=%s dist=%s bytes=%d", from, tostring(distribution), type(message)=="string" and #message or 0)
-  if from == me then return end
-
-  local ok, decoded = AceSerializer:Deserialize(message)
-  if not ok or type(decoded) ~= "table" then debugf("Deserialize FAILED from %s", from); return end
-
-  local incomingT = tonumber(decoded.t) or 0
-  if incomingT <= (Addon._lastSync or 0) then debugf("Ignored older/equal sync from %s (t=%s <= %s).", from, tostring(incomingT), tostring(Addon._lastSync or 0)); return end
-  Addon._lastSync = incomingT
-
-  if decoded.op == "set" and type(decoded.name) == "string" then
-    local a = getAssignment(decoded.name)
-    if decoded.curse  then a.curse  = decoded.curse  end
-    if decoded.banish then a.banish = decoded.banish end
-    debugf("Applied %s update from %s for %s.", decoded.curse and "curse" or "banish", from, decoded.name)
-    if Addon.RebuildRows then Addon:RebuildRows() end
-    return
-  end
-
-  if decoded.op == "full" and type(decoded.data) == "table" then
-    Addon.db.profile.assignments = shallowCopy(decoded.data)
-    debugf("Applied full table from %s.", from)
-    if Addon.RebuildRows then Addon:RebuildRows() end
-    return
-  end
-
-  -- Version check logic
-  if decoded.op == "version" and type(decoded.version) == "string" then
-    Addon.versions[from] = decoded.version
-    if decoded.version ~= ADDON_VERSION then
-      local msg
-      if decoded.version > ADDON_VERSION then
-        msg = string.format("|cffff5555[WCP]|r %s is using a newer version (%s). Please update!", from, decoded.version)
-      else
-        msg = string.format("|cffff5555[WCP]|r %s is using an older version (%s). Ask them to update!", from, decoded.version)
-      end
-      DEFAULT_CHAT_FRAME:AddMessage(msg)
-    end
-    return
-  end
-end
-
-Addon:RegisterComm(COMM_PREFIX)
-
 local function sendComm(distribution, serialized, target)
   local size = (type(serialized) == "string") and #serialized or 0
   if type(serialized) ~= "string" or size == 0 then
@@ -264,9 +289,12 @@ local function broadcastSet(name, field, key)
   broadcastPayload(p, "set-" .. field)
 end
 
-local function broadcastFull(reason) debugf("broadcastFull: sending full table"); broadcastPayload({ t = now(), op = "full", data = Addon.db.profile.assignments }, reason or "full") end
+local function broadcastFull(reason)
+  debugf("broadcastFull: sending full table")
+  broadcastPayload({ t = now(), op = "full", data = Addon.db.profile.assignments }, reason or "full")
+end
 
--- =============================== UI =================================
+-- =============================== UI (Main window) ==========================
 Addon.ui = { frame = nil, rowsGroup = nil, rows = {} }
 
 local function stripFrameBorders(frame)
@@ -365,7 +393,6 @@ local function skinDropdown(widget)
     widget.button:SetHighlightTexture(hl)
   end
 
-  -- Hook pullout Open so first click is already skinned
   local function hookPulloutOpen()
     if widget.pullout and widget.pullout.Open and not widget.pullout.__wcp_hooked then
       widget.pullout.__wcp_hooked = true
@@ -419,10 +446,10 @@ function Addon:BuildWindow()
   f:SetLayout("List"); f:EnableResize(true)
   stripFrameBorders(f.frame); ensureBackdrop(f.frame, 0.5)
 
-  -- ESC to close (robust) without blocking input
+  -- ESC to close without blocking input
   addToUISpecialFrames(f.frame)
   f.frame:EnableKeyboard(true)
-  if f.frame.SetPropagateKeyboardInput then f.frame:SetPropagateKeyboardInput(true) end  -- << allow WASD/chat while open
+  if f.frame.SetPropagateKeyboardInput then f.frame:SetPropagateKeyboardInput(true) end
   f.frame:HookScript("OnKeyDown", function(self, key)
     if key == "ESCAPE" then self:Hide() end
   end)
@@ -488,6 +515,14 @@ function Addon:ReleaseRows()
   wipe(self.ui.rows)
 end
 
+-- Update summary if it's visible
+function Addon:UpdateSummaryIfVisible()
+  if Addon.compact and Addon.compact.frame and Addon.compact.frame:IsShown()
+     and not Addon.compactUserClosed and not Addon.db.profile.summary.hidden then
+    Addon:UpdateSummaryRows()
+  end
+end
+
 function Addon:RebuildRows()
   if not self.ui.rowsGroup then return end
   self:ReleaseRows()
@@ -495,11 +530,39 @@ function Addon:RebuildRows()
     local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); row:SetHeight(28)
     local nameLbl = AceGUI:Create("Label"); nameLbl:SetRelativeWidth(0.33); nameLbl:SetText(string.format("|cffffff00%s|r", name)); row:AddChild(nameLbl)
     local a = getAssignment(name)
-    local curse = dropdownFromChoices(CURSE_CHOICES, a.curse, nil, function(newK) setAssignment(name, newK, nil); debugf("Set curse for %s -> %s", name, CURSE_CHOICES[newK] or newK); broadcastSet(name, "curse", newK) end); curse:SetRelativeWidth(0.34); row:AddChild(curse)
-    local ban   = dropdownFromChoices(BANISH_CHOICES, a.banish, nil, function(newK) setAssignment(name, nil, newK); debugf("Set banish for %s -> %s", name, BANISH_NAMES[newK] or newK); broadcastSet(name, "banish", newK) end); ban:SetRelativeWidth(0.33); row:AddChild(ban)
+
+    -- Curse dropdown with iconized labels (CURSE_CHOICES); logs/chat use CURSE_NAMES
+    local curse = dropdownFromChoices(
+      CURSE_CHOICES,
+      a.curse,
+      nil,
+      function(newK)
+        setAssignment(name, newK, nil)
+        debugf("Set curse for %s -> %s", name, CURSE_NAMES[newK] or newK)
+        broadcastSet(name, "curse", newK)
+        Addon:UpdateSummaryIfVisible()
+      end
+    )
+    curse:SetRelativeWidth(0.34); row:AddChild(curse)
+
+    local ban = dropdownFromChoices(
+      BANISH_CHOICES,
+      a.banish,
+      nil,
+      function(newK)
+        setAssignment(name, nil, newK)
+        debugf("Set banish for %s -> %s", name, BANISH_NAMES[newK] or newK)
+        broadcastSet(name, "banish", newK)
+        Addon:UpdateSummaryIfVisible()
+      end
+    )
+    ban:SetRelativeWidth(0.33); row:AddChild(ban)
+
     self.ui.rowsGroup:AddChild(row)
     self.ui.rows[name] = { group = row, nameLabel = nameLbl, curseDrop = curse, banishDrop = ban }
   end
+
+  Addon:UpdateSummaryIfVisible()
 end
 
 -- ============================ Announce ===========================
@@ -510,23 +573,31 @@ function Addon:AnnounceAssignments()
   debugf("Announce: warlocks found=%d", #wl)
 
   local chan = pickChat()
-  SendChatMessage(toChatSafe("Warlock assignments:", true), chan)
+  SendChatMessage(toChatSafe("Warlock assignments:", true, Addon.db.profile.chatIcons), chan)
 
   local lines = 0
   for _, name in ipairs(wl) do
     local a = getAssignment(name)
-    local hasCurse  = a.curse  and a.curse  ~= "NONE"
+    local hasCurse  = a.curse  and a.curse  ~= "NONE" and VALID_CURSE[a.curse]
     local hasBanish = a.banish and a.banish ~= "NONE"
     if hasCurse or hasBanish then
       local parts = { name }
-      if hasCurse then parts[#parts+1] = CURSE_CHOICES[a.curse] or "-" end
+      if hasCurse then
+        local cname = CURSE_NAMES[a.curse] or "-"
+        local cicon = Addon.db.profile.chatIcons and (CURSE_CHAT_ICONS[a.curse] or "") or ""
+        if cicon ~= "" then
+          parts[#parts+1] = cicon .. " " .. cname
+        else
+          parts[#parts+1] = cname
+        end
+      end
       if hasBanish then
         local btok  = BANISH_TOKENS[a.banish] or ""
         local bname = BANISH_NAMES[a.banish]  or "-"
         parts[#parts+1] = ("Banish: %s %s"):format(btok, bname)
       end
       local msg = table.concat(parts, "  ")
-      SendChatMessage(toChatSafe(msg, true), chan)
+      SendChatMessage(toChatSafe(msg, true, Addon.db.profile.chatIcons), chan)
       lines = lines + 1
     end
   end
@@ -538,23 +609,12 @@ end
 local ef = CreateFrame("Frame")
 ef:RegisterEvent("PLAYER_LOGIN"); ef:RegisterEvent("GROUP_ROSTER_UPDATE"); ef:RegisterEvent("PLAYER_ROLES_ASSIGNED")
 ef:SetScript("OnEvent", function(_, evt)
-  if evt == "PLAYER_LOGIN" then Addon:RegisterComm(COMM_PREFIX); debugf("PLAYER_LOGIN: RegisterComm(%s) done", COMM_PREFIX)
-  else if Addon.ui.frame then Addon:RebuildRows() end end
+  if Addon.ui.frame then Addon:RebuildRows() end
 end)
 
--- Slash: /wcp (toggle) and /wcp test
-SLASH_WCP1 = "/wcp"
-SlashCmdList["WCP"] = function(msg)
-  msg = msg and msg:lower() or ""
-  if msg == "test" then
-    local payload = { t = now(), op = "set", name = UnitName("player"), curse = "TEST" }
-    debugf("Manual test: sending TEST payload"); broadcastPayload(payload, "manual-test"); return
-  end
-  if Addon.ui.frame then Addon.ui.frame:Hide(); Addon.ui.frame = nil else Addon:BuildWindow() end
-end
-
--- =================== Compact Assignment Summary Window ===================
-Addon.compactUI = { frame = nil }
+-- =================== Compact Assignment Summary Window (Native) ===================
+Addon.compact = { frame = nil, rows = {} }
+Addon.compactUserClosed = false
 
 -- Abbreviated curse icons (16x16) for compact display
 local CURSE_ICONS = {
@@ -562,18 +622,19 @@ local CURSE_ICONS = {
   COS = "Interface\\Icons\\Spell_Shadow_CurseOfAchimonde",     -- Curse of Shadow
   COR = "Interface\\Icons\\Spell_Shadow_UnholyStrength",       -- Curse of Recklessness
   COW = "Interface\\Icons\\Spell_Shadow_CurseOfMannoroth",     -- Curse of Weakness
-  COA = 136139,         -- Curse of Agony
+  COA = 136139,                                                -- Curse of Agony (fileID)
   COD = "Interface\\Icons\\Spell_Shadow_AuraOfDarkness",       -- Curse of Doom
-  COT = "Interface\\Icons\\Spell_Shadow_CurseOfTounges",       -- Curse of Tongues
+  COT = "Interface\\Icons\\Spell_Shadow_CurseOfTounges",       -- Curse of Tongues (Blizz asset typo)
   NONE = nil,
 }
 
 local function getCurseIconOrAbbr(key)
+  if not VALID_CURSE[key] then return "-" end
   local icon = CURSE_ICONS[key]
   if icon then
     return "|T" .. icon .. ":16:16:0:0:64:64:4:60:4:60|t"
   end
-  return key or "-"
+  return CURSE_NAMES[key] or "-"
 end
 
 local function getBanishIcon(key)
@@ -591,7 +652,6 @@ local function getBanishIcon(key)
   return icons[key] or ""
 end
 
--- Add missing hasAnyAssignments function
 local function hasAnyAssignments()
   for _, name in ipairs(playerListWarlocks()) do
     local a = getAssignment(name)
@@ -602,129 +662,330 @@ local function hasAnyAssignments()
   return false
 end
 
--- Track if the user manually closed the summary box
-Addon.compactUIUserClosed = false
+-- Size persistence (no position here; position is in WCP_DB)
+local function saveSummarySize(f)
+  local s = Addon.db.profile.summary
+  s.width  = f:GetWidth()
+  s.height = f:GetHeight()
+end
 
-function Addon:ShowCompactWindow(force)
-  if Addon.compactUIUserClosed and not force then return end
+---------------------------------------------------------------------------
+-- WCP Summary Position Persistence (for Addon.compact.frame)
+-- Keeps the wcpsummary window where the user dragged it across reloads/logins.
+---------------------------------------------------------------------------
 
-  if self.compactUI.frame then
-    self.compactUI.frame:Show()
-    self:UpdateCompactRows()
-    return
+-- Per-character SavedVariables bucket
+local function WCP_GetCharKey()
+  local name, realm = UnitName("player"), GetRealmName()
+  return string.format("%s - %s", name or "Unknown", realm or "Unknown")
+end
+
+local function WCP_DB_Frames()
+  WCP_DB = WCP_DB or {}
+  local ck = WCP_GetCharKey()
+  WCP_DB[ck] = WCP_DB[ck] or {}
+  WCP_DB[ck].frames = WCP_DB[ck].frames or {}
+  return WCP_DB[ck].frames
+end
+
+-- One-time cleanup: migrate legacy summary position from AceDB to WCP_DB, then remove it.
+local function WCP_CleanupLegacySummaryPos()
+  local s = Addon.db and Addon.db.profile and Addon.db.profile.summary
+  if not s or s._cleaned then return end
+
+  local frames = WCP_DB_Frames()
+  if not frames["WCP_SummaryFrame"] and s.point and s.relativePoint then
+    frames["WCP_SummaryFrame"] = {
+      point    = s.point,
+      relPoint = s.relativePoint,
+      x        = s.x or 0,
+      y        = s.y or 0,
+    }
   end
 
-  local f = AceGUI:Create("Frame")
-  f:SetTitle("WCP Assignments")
-  f:SetWidth(220); f:SetHeight(180)
-  f:SetLayout("List")
-  f:EnableResize(false)
-  stripFrameBorders(f.frame)
-  ensureBackdrop(f.frame, 0.5)
+  s.point, s.relativePoint, s.x, s.y = nil, nil, nil, nil
+  s._cleaned = true
+end
 
-  -- Assignment rows
-  local rows = AceGUI:Create("SimpleGroup")
-  rows:SetFullWidth(true)
-  rows:SetLayout("List")
-  f:AddChild(rows)
+local function WCP_SavePos(frame, key)
+  if not (frame and key) then return end
+  local point, _, relPoint, x, y = frame:GetPoint(1)
+  WCP_DB_Frames()[key] = {
+    point = point or "CENTER",
+    relPoint = relPoint or "CENTER",
+    x = x or 0,
+    y = y or 0,
+  }
+end
 
-  function Addon:UpdateCompactRows()
-    if Addon.compactUIUserClosed then return end
-    rows:ReleaseChildren()
-    for _, name in ipairs(playerListWarlocks()) do
-      local a = getAssignment(name)
-      local curseIcon = getCurseIconOrAbbr(a.curse)
-      local curseText = CURSE_CHOICES[a.curse] or "-"
-      local banishIcon = getBanishIcon(a.banish)
-      local row = AceGUI:Create("InteractiveLabel")
-      row:SetText(string.format("|cffffff00%s|r  %s %s  %s", name, curseIcon, curseText, banishIcon))
-      row:SetFullWidth(true)
-      rows:AddChild(row)
-    end
+local function WCP_RestorePos(frame, key)
+  if not (frame and key) then return end
+  local db = WCP_DB_Frames()[key]
+  frame:ClearAllPoints()
+  if db then
+    frame:SetPoint(db.point, UIParent, db.relPoint, db.x, db.y)
+  else
+    frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+  end
+end
+
+-- Reset helper: clears saved pos, recenters, and shows the summary
+function Addon:ResetSummaryPosition()
+  local frames = WCP_DB_Frames()
+  frames["WCP_SummaryFrame"] = nil
+
+  local f = Addon.compact.frame
+  if f then
+    f:ClearAllPoints()
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    WCP_SavePos(f, "WCP_SummaryFrame")
   end
 
-  -- Bottom button group (Notify + Close)
-  local buttonGroup = AceGUI:Create("SimpleGroup")
-  buttonGroup:SetLayout("Flow")
-  buttonGroup:SetFullWidth(true)
+  Addon.db.profile.summary.hidden = false
+  Addon.compactUserClosed = false
+  Addon:ShowSummary(true)
+  debugf("Summary position reset to center and saved.")
+end
 
-  -- Notify button
-  local notifyBtn = AceGUI:Create("Button")
-  notifyBtn:SetText("Notify")
-  notifyBtn:SetWidth(90)
-  notifyBtn:SetCallback("OnClick", function() Addon:AnnounceAssignments() end)
-  buttonGroup:AddChild(notifyBtn)
+-- Call this once after Addon.compact.frame is created
+function Addon:EnableSummaryPersistence()
+  local frame = Addon and Addon.compact and Addon.compact.frame
+  if not frame then return end
 
-  -- Close button (calls the same logic as the window X)
-  local closeBtn = AceGUI:Create("Button")
-  closeBtn:SetText("Close")
-  closeBtn:SetWidth(90)
-  closeBtn:SetCallback("OnClick", function()
-    Addon.compactUIUserClosed = true
+  frame.ignoreFramePositionManager = true
+  frame:SetUserPlaced(false)
+
+  frame:SetMovable(true)
+  frame:EnableMouse(true)
+  frame:RegisterForDrag("LeftButton")
+  frame:SetClampedToScreen(true)
+
+  frame:SetScript("OnDragStart", function(self)
+    if self:IsMovable() then self:StartMoving() end
+  end)
+
+  frame:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    WCP_SavePos(self, "WCP_SummaryFrame")
+  end)
+
+  frame:HookScript("OnShow", function(self)
+    WCP_RestorePos(self, "WCP_SummaryFrame")
+  end)
+
+  if not Addon._wcp_pos_login_hook then
+    Addon._wcp_pos_login_hook = CreateFrame("Frame")
+    Addon._wcp_pos_login_hook:RegisterEvent("PLAYER_LOGIN")
+    Addon._wcp_pos_login_hook:SetScript("OnEvent", function()
+      local f = Addon and Addon.compact and Addon.compact.frame
+      if f then WCP_RestorePos(f, "WCP_SummaryFrame") end
+    end)
+  end
+end
+
+local function buildSummaryFrame()
+  if Addon.compact.frame then return Addon.compact.frame end
+
+  local s = Addon.db.profile.summary
+  local f = CreateFrame("Frame", "WCP_SummaryFrame", UIParent, "BackdropTemplate")
+  f:SetFrameStrata("DIALOG")
+  f:SetClampedToScreen(true)
+  f:SetMovable(true)
+  f:EnableMouse(true)
+  f:RegisterForDrag("LeftButton")
+
+  f:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8" })
+  f:SetBackdropColor(0, 0, 0, 0.5)
+  f:SetSize(s.width or 260, s.height or 200)
+
+  local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  title:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -8)
+  title:SetText("|cffffd100WCP Assignments|r")
+
+  local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", f, "TOPRIGHT", 2, 1)
+  close:SetScript("OnClick", function()
+    Addon.compactUserClosed = true
+    Addon.db.profile.summary.hidden = true
     f:Hide()
   end)
-  buttonGroup:AddChild(closeBtn)
 
-  f:AddChild(buttonGroup)
+  local content = CreateFrame("Frame", nil, f)
+  content:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -28)
+  content:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -10, 46)
 
-  -- When the user closes the frame via the window X, remember it
-  f:SetCallback("OnClose", function(widget)
-    Addon.compactUIUserClosed = true
-    widget:Hide()
+  Addon.compact.rows = {}
+
+  local function acquireRow(i)
+    local row = Addon.compact.rows[i]
+    if not row then
+      row = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+      Addon.compact.rows[i] = row
+    end
+    row:ClearAllPoints()
+    if i == 1 then
+      row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -2)
+    else
+      row:SetPoint("TOPLEFT", Addon.compact.rows[i-1], "BOTTOMLEFT", 0, -4)
+    end
+    row:SetJustifyH("LEFT")
+    row:SetJustifyV("TOP")
+    row:Show()
+    return row
+  end
+
+  local btnBar = CreateFrame("Frame", nil, f)
+  btnBar:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 10, 8)
+  btnBar:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -10, 8)
+  btnBar:SetHeight(28)
+
+  local notify = CreateFrame("Button", nil, btnBar, "UIPanelButtonTemplate")
+  notify:SetText("Notify")
+  notify:SetWidth(100)
+  notify:SetPoint("CENTER", btnBar, "CENTER", -60, 0)
+  notify:SetScript("OnClick", function() Addon:AnnounceAssignments() end)
+
+  local closeBtn = CreateFrame("Button", nil, btnBar, "UIPanelButtonTemplate")
+  closeBtn:SetText("Close")
+  closeBtn:SetWidth(100)
+  closeBtn:SetPoint("CENTER", btnBar, "CENTER", 60, 0)
+  closeBtn:SetScript("OnClick", function()
+    Addon.compactUserClosed = true
+    Addon.db.profile.summary.hidden = true
+    f:Hide()
   end)
 
-  self.compactUI.frame = f
-  self:UpdateCompactRows()
-end
+  f:SetScript("OnSizeChanged", function(self)
+    local sum = Addon.db.profile.summary
+    sum.width, sum.height = self:GetWidth(), self:GetHeight()
+  end)
 
-function Addon:AutoCompactWindow()
-  -- Only show if not manually closed
-  if hasAnyAssignments() then
-    Addon:ShowCompactWindow()
-  elseif self.compactUI.frame then
-    self.compactUI.frame:Hide()
+  -- No ESC close here
+
+  f:SetScript("OnShow", function(self)
+    Addon:UpdateSummaryRows()
+  end)
+
+  Addon.compact.frame = f
+
+  Addon:EnableSummaryPersistence()
+  WCP_RestorePos(f, "WCP_SummaryFrame")
+
+  function Addon:UpdateSummaryRows()
+    if not Addon.compact.frame or not Addon.compact.frame:IsShown() then return end
+    local warlocks = playerListWarlocks()
+    for _, font in ipairs(Addon.compact.rows) do font:Hide() end
+
+    local announceable = 0
+    if #warlocks == 0 then
+      local r = acquireRow(1)
+      r:SetText("|cffbbbbbbNo warlocks detected in your group/raid.|r")
+    else
+      local i = 0
+      for _, name in ipairs(warlocks) do
+        local a = getAssignment(name)
+        local hasCurse  = a.curse  and a.curse  ~= "NONE" and VALID_CURSE[a.curse]
+        local hasBanish = a.banish and a.banish ~= "NONE"
+        if hasCurse or hasBanish then announceable = announceable + 1 end
+
+        local curseIcon  = getCurseIconOrAbbr(a.curse)
+        local curseText  = VALID_CURSE[a.curse] and (CURSE_NAMES[a.curse] or "-") or "-"
+        local banishIcon = getBanishIcon(a.banish)
+
+        i = i + 1
+        local r = acquireRow(i)
+        r:SetText(string.format("|cffffff00%s|r  %s %s  %s", name, curseIcon, curseText, banishIcon))
+      end
+      if i == 0 then
+        local r = acquireRow(1)
+        r:SetText("|cffbbbbbbNo active assignments.|r")
+      end
+    end
+
+    notify:SetEnabled(announceable > 0)
   end
+
+  return f
 end
 
--- Update summary box rows whenever assignments/banishes change, but only if visible and not user-closed
+function Addon:ShowSummary(force)
+  if (Addon.compactUserClosed or Addon.db.profile.summary.hidden) and not force then return end
+  local f = buildSummaryFrame()
+  f:Show()
+  Addon.db.profile.summary.hidden = false
+  Addon.compactUserClosed = false
+  Addon:UpdateSummaryRows()
+end
+
+function Addon:HideSummary()
+  if Addon.compact.frame then
+    Addon.compact.frame:Hide()
+  end
+  Addon.compactUserClosed = true
+  Addon.db.profile.summary.hidden = true
+end
+
+function Addon:AutoSummaryWindow()
+  if Addon.db.profile.summary.hidden then
+    if Addon.compact.frame then Addon.compact.frame:Hide() end
+    return
+  end
+  -- If the user did not hide it, always show it (persist across reload/login)
+  Addon:ShowSummary(true)
+end
+
+-- Keep summary rows updated if visible
 hooksecurefunc(Addon, "RebuildRows", function(self)
-  if Addon.compactUI.frame and Addon.compactUI.frame:IsShown() and not Addon.compactUIUserClosed then
-    Addon:UpdateCompactRows()
-  end
+  Addon:UpdateSummaryIfVisible()
 end)
 
--- Also check on login and group changes
+-- Also check on login and group changes (+ legacy cleanup before showing)
 local ef2 = CreateFrame("Frame")
 ef2:RegisterEvent("PLAYER_LOGIN")
 ef2:RegisterEvent("GROUP_ROSTER_UPDATE")
 ef2:RegisterEvent("PLAYER_ROLES_ASSIGNED")
 ef2:SetScript("OnEvent", function(_, evt)
   if evt == "PLAYER_LOGIN" or evt == "GROUP_ROSTER_UPDATE" or evt == "PLAYER_ROLES_ASSIGNED" then
-    Addon:AutoCompactWindow()
+    WCP_CleanupLegacySummaryPos()
+    Addon:AutoSummaryWindow()
   end
-  if evt == "PLAYER_LOGIN" then
-    Addon:RegisterComm(COMM_PREFIX)
-    debugf("PLAYER_LOGIN: RegisterComm(%s) done", COMM_PREFIX)
-  else
-    if Addon.ui.frame then Addon:RebuildRows() end
-  end
+  if Addon.ui.frame then Addon:RebuildRows() end
 end)
 
--- Slash command to toggle compact window (force open, reset manual close)
-SLASH_WCPSUMMARY1 = "/wcpsummary"
-SlashCmdList["WCPSUMMARY"] = function()
-  Addon.compactUIUserClosed = false
-  if Addon.compactUI.frame and Addon.compactUI.frame:IsShown() then
-    Addon.compactUI.frame:Hide()
-    Addon.compactUIUserClosed = true
+-- ====================== Slash Commands ======================
+-- /wcp (main) with a subcommand: resetsummary
+SLASH_WCP1 = "/wcp"
+SlashCmdList["WCP"] = function(msg)
+  msg = (msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+
+  if msg == "resetsummary" or msg == "reset summary" then
+    Addon:ResetSummaryPosition()
+    return
+  end
+
+  if msg == "test" then
+    local payload = { t = now(), op = "set", name = UnitName("player"), curse = "TEST" }
+    debugf("Manual test: sending TEST payload"); broadcastPayload(payload, "manual-test"); return
+  end
+
+  -- default: toggle main window
+  if Addon.ui.frame then
+    Addon.ui.frame:Hide()
+    Addon.ui.frame = nil
   else
-    Addon:ShowCompactWindow(true)
+    Addon:BuildWindow()
   end
 end
 
-local ADDON_VERSION = WarlockCursePower_VERSION or "dev"
+-- /wcpsummary and /wcps — both OPEN the summary window (not toggle)
+SLASH_WCPSUMMARY1 = "/wcpsummary"
+SLASH_WCPSUMMARY2 = "/wcps"
+SlashCmdList["WCPSUMMARY"] = function()
+  Addon:ShowSummary(true)
+end
 
--- Track if we've already sent a version check this session
+-- ====================== Version Check (comms) =====================
+local ADDON_VERSION = WarlockCursePower_VERSION or "dev"
 Addon.versionCheckSent = false
 Addon.versions = {}
 
@@ -745,7 +1006,6 @@ function Addon:SendVersionCheck()
   end)
 end
 
--- On login or group change, send version check (only once per session)
 local efVersion = CreateFrame("Frame")
 efVersion:RegisterEvent("PLAYER_LOGIN")
 efVersion:RegisterEvent("GROUP_ROSTER_UPDATE")
@@ -755,36 +1015,61 @@ efVersion:SetScript("OnEvent", function(_, evt)
   end
 end)
 
--- Update OnCommReceived to handle version checks
-local oldOnCommReceived = Addon.OnCommReceived
+-- =============== Unified OnCommReceived (with debounce) ===============
 function Addon:OnCommReceived(prefix, message, distribution, sender)
   if prefix ~= COMM_PREFIX then return end
   local me   = safeAmbiguate(UnitName("player"))
   local from = safeAmbiguate(sender or "")
+  if from == me then return end
+
   local ok, decoded = AceSerializer:Deserialize(message)
   if not ok or type(decoded) ~= "table" then return end
 
-  -- Version check logic
+  -- 1) Version check (debounced per sender)
   if decoded.op == "version" and type(decoded.version) == "string" then
     Addon.versions[from] = decoded.version
-    if decoded.version ~= ADDON_VERSION then
-      local msg
-      if decoded.version > ADDON_VERSION then
-        msg = string.format("|cffff5555[WCP]|r %s is using a newer version (%s). Please update!", from, decoded.version)
-      else
-        msg = string.format("|cffff5555[WCP]|r %s is using an older version (%s). Ask them to update!", from, decoded.version)
-      end
+    Addon._versionNotified = Addon._versionNotified or {}
+    if not Addon._versionNotified[from] and decoded.version ~= ADDON_VERSION then
+      Addon._versionNotified[from] = true
+      local msg = (decoded.version > ADDON_VERSION)
+        and string.format("|cffff5555[WCP]|r %s is using a newer version (%s). Please update!", from, decoded.version)
+        or  string.format("|cffff5555[WCP]|r %s is using an older version (%s). Ask them to update!", from, decoded.version)
       DEFAULT_CHAT_FRAME:AddMessage(msg)
     end
     return
   end
 
-  -- Call the original OnCommReceived for assignment sync
-  if oldOnCommReceived then
-    oldOnCommReceived(self, prefix, message, distribution, sender)
+  -- 2) Assignment sync (timestamp guard)
+  local incomingT = tonumber(decoded.t) or 0
+  if incomingT <= (Addon._lastSync or 0) then return end
+  Addon._lastSync = incomingT
+
+  if decoded.op == "set" and type(decoded.name) == "string" then
+    local a = getAssignment(decoded.name)
+    if decoded.curse  then a.curse  = decoded.curse  end
+    if decoded.banish then a.banish = decoded.banish end
+    if Addon.RebuildRows then Addon:RebuildRows() end
+    Addon:UpdateSummaryIfVisible()
+    return
+  end
+
+  if decoded.op == "full" and type(decoded.data) == "table" then
+    Addon.db.profile.assignments = shallowCopy(decoded.data)
+    if Addon.RebuildRows then Addon:RebuildRows() end
+    Addon:UpdateSummaryIfVisible()
+    return
   end
 end
 
+-- =============== One-time comm registration at login ===============
+local efReg = CreateFrame("Frame")
+efReg:RegisterEvent("PLAYER_LOGIN")
+efReg:SetScript("OnEvent", function()
+  Addon:RegisterComm(COMM_PREFIX)
+  debugf("RegisterComm(%s) ready", COMM_PREFIX)
+end)
+
+-- ========================== Library Guard =========================
 if not AceGUI or not AceSerializer or not AceDB or not AceComm then
   print("|cffff0000[WCP]|r Missing required libraries. Check your installation.")
 end
